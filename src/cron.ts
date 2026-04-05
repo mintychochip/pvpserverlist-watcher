@@ -3,6 +3,9 @@
  * Usage: npm start (runs indefinitely)
  */
 
+import dotenv from "dotenv";
+dotenv.config();
+
 import { runWatcherCycle } from "./index";
 
 const INTERVAL_MS = 5 * 60 * 1000; // 5 minutes

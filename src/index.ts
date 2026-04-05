@@ -1,52 +1,42 @@
 /**
  * Minecraft Server Watcher
- * Pings all servers via SLP protocol and upserts status to Supabase.
+ * Fetches server status via mcsrvstat.us API and upserts to Supabase.
  */
 
 import { createClient } from "@supabase/supabase-js";
-import dgram from "dgram";
+import https from "https";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY!;
 
-const PROTOCOL_VERSION = 47; // 1.8 protocol - works across all versions
-const TIMEOUT_MS = 4000;
-const BATCH_SIZE = 50;
+const TIMEOUT_MS = 8000;
+const BATCH_SIZE = 20;
+const CONCURRENCY = 5;
 
-// ─── SLP Protocol ───────────────────────────────────────────────────────────
+// ─── HTTP Fetch ─────────────────────────────────────────────────────────────
 
-function buildHandshakePacket(protocolVersion: number, serverAddress: string, serverPort: number): Buffer {
-  const addrBytes = Buffer.from(serverAddress, "utf8");
-  const packet = Buffer.alloc(1 + varintLen(protocolVersion) + varintLen(addrBytes.length) + addrBytes.length + 2 + varintLen(1));
-  let offset = 0;
-  packet.writeUInt8(0x00, offset++);
-  offset = writeVarint(packet, offset, protocolVersion);
-  offset = writeVarint(packet, offset, addrBytes.length);
-  addrBytes.copy(packet, offset);
-  offset += addrBytes.length;
-  packet.writeUInt16LE(serverPort, offset);
-  offset += 2;
-  writeVarint(packet, offset, 1);
-  return packet;
-}
-
-function buildRequestPacket(): Buffer {
-  return Buffer.from([0xFE, 0x01]);
-}
-
-function varintLen(value: number): number {
-  let len = 0;
-  while (value > 0x7f) { len++; value >>= 7; }
-  return len + 1;
-}
-
-function writeVarint(buf: Buffer, offset: number, value: number): number {
-  while (value > 0x7f) {
-    buf.writeUInt8((value & 0x7f) | 0x80, offset++);
-    value >>= 7;
-  }
-  buf.writeUInt8(value & 0x7f, offset++);
-  return offset;
+function fetchJson(url: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, {
+      headers: { "User-Agent": "PvPServerList-Watcher/1.0" },
+      timeout: TIMEOUT_MS,
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch {
+          reject(new Error("Invalid JSON"));
+        }
+      });
+    });
+    req.on("error", reject);
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Timeout"));
+    });
+  });
 }
 
 // ─── Supabase ───────────────────────────────────────────────────────────────
@@ -83,7 +73,7 @@ async function fetchAllServers(): Promise<Server[]> {
 }
 
 async function upsertServerStatus(
-  supabase: ReturnType<typeof createClient>,
+  supabase: any,
   serverId: string,
   status: boolean,
   latencyMs: number | null,
@@ -105,7 +95,7 @@ async function upsertServerStatus(
   );
 }
 
-// ─── Server Ping ────────────────────────────────────────────────────────────
+// ─── Server Status via mcsrvstat.us ────────────────────────────────────────
 
 interface PingResult {
   status: boolean;
@@ -115,59 +105,21 @@ interface PingResult {
   motd: string;
 }
 
-function pingServer(ip: string, port: number): Promise<PingResult> {
-  return new Promise((resolve) => {
-    const udp = dgram.createSocket("udp4");
-    const start = Date.now();
-    let resolved = false;
-
-    const doResolve = (result: PingResult) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timeout);
-      try { udp.close(); } catch { /* ignore */ }
-      resolve(result);
-    };
-
-    const timeout = setTimeout(() => {
-      doResolve({ status: false, latency_ms: null, player_count: 0, max_players: 0, motd: "" });
-    }, TIMEOUT_MS);
-
-    udp.on("error", () => {
-      doResolve({ status: false, latency_ms: null, player_count: 0, max_players: 0, motd: "" });
-    });
-
-    udp.on("message", (buf: Buffer) => {
-      if (resolved) return;
-      const latency_ms = Date.now() - start;
-
-      if (buf.length < 3 || buf[0] !== 0xff) {
-        doResolve({ status: false, latency_ms: null, player_count: 0, max_players: 0, motd: "" });
-        return;
-      }
-
-      try {
-        const jsonLen = buf.readUInt16BE(1);
-        const jsonStr = buf.slice(3, 3 + jsonLen).toString("utf8");
-        const data = JSON.parse(jsonStr);
-
-        doResolve({
-          status: true,
-          latency_ms,
-          player_count: data.players?.online ?? 0,
-          max_players: data.players?.max ?? 0,
-          motd: data.description?.text ?? data.description ?? "",
-        });
-      } catch {
-        doResolve({ status: false, latency_ms: null, player_count: 0, max_players: 0, motd: "" });
-      }
-    });
-
-    udp.send(buildHandshakePacket(PROTOCOL_VERSION, ip, port), port, ip, (err: Error | null) => {
-      if (err) { doResolve({ status: false, latency_ms: null, player_count: 0, max_players: 0, motd: "" }); return; }
-      udp.send(buildRequestPacket(), port, ip, () => {});
-    });
-  });
+async function pingServer(ip: string, port: number): Promise<PingResult> {
+  const url = `https://api.mcsrvstat.us/3/${ip}:${port}`;
+  try {
+    const data = await fetchJson(url);
+    if (!data?.online) {
+      return { status: false, latency_ms: null, player_count: 0, max_players: 0, motd: "" };
+    }
+    const latency = data.debug?.ping ?? null;
+    const motd = data.motd?.clean?.[0] ?? data.motd?.html?.[0] ?? "";
+    const players = data.players?.online ?? 0;
+    const maxPlayers = data.players?.max ?? 0;
+    return { status: true, latency_ms: latency, player_count: players, max_players: maxPlayers, motd };
+  } catch {
+    return { status: false, latency_ms: null, player_count: 0, max_players: 0, motd: "" };
+  }
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -180,21 +132,36 @@ export async function runWatcherCycle(): Promise<{ online: number; offline: numb
   });
 
   const servers = await fetchAllServers();
-  console.log(`Watcher: found ${servers.length} servers to ping`);
+  console.log(`Watcher: found ${servers.length} servers to check`);
 
   let online = 0, offline = 0;
   const errors: string[] = [];
 
-  for (let i = 0; i < servers.length; i += BATCH_SIZE) {
-    const batch = servers.slice(i, i + BATCH_SIZE);
+  // Process in batches with controlled concurrency
+  for (let i = 0; i < servers.length; i += BATCH_SIZE * CONCURRENCY) {
+    const batch = servers.slice(i, i + BATCH_SIZE * CONCURRENCY);
 
-    try {
-      const results = await Promise.all(
-        batch.map((s) => pingServer(s.ip, s.port).then((r) => ({ server: s, result: r })))
-      );
+    const chunkResults = await Promise.all(
+      batch.map(async (server) => {
+        try {
+          const result = await pingServer(server.ip, server.port);
+          return { server, result, error: null };
+        } catch (err) {
+          return { server, result: null, error: String(err) };
+        }
+      })
+    );
+
+    // Upsert in smaller sub-batches to avoid overwhelming Supabase
+    for (let j = 0; j < chunkResults.length; j += BATCH_SIZE) {
+      const subBatch = chunkResults.slice(j, j + BATCH_SIZE);
 
       await Promise.all(
-        results.map(async ({ server, result }) => {
+        subBatch.map(async ({ server, result, error }) => {
+          if (error || !result) {
+            errors.push(`Error checking ${server.name}: ${error}`);
+            return;
+          }
           try {
             await upsertServerStatus(
               supabase,
@@ -207,7 +174,7 @@ export async function runWatcherCycle(): Promise<{ online: number; offline: numb
             );
             if (result.status) {
               online++;
-              console.log(`  ✓ ${server.name} (${server.ip}) — ${result.player_count}/${result.max_players} players, ${result.latency_ms}ms`);
+              console.log(`  ✓ ${server.name} (${server.ip}) — ${result.player_count}/${result.max_players} players${result.latency_ms ? `, ${result.latency_ms}ms` : ""}`);
             } else {
               offline++;
               console.log(`  ✗ ${server.name} (${server.ip}) — offline`);
@@ -217,8 +184,6 @@ export async function runWatcherCycle(): Promise<{ online: number; offline: numb
           }
         })
       );
-    } catch (err) {
-      errors.push(`Batch ${i / BATCH_SIZE} failed: ${err}`);
     }
   }
 
